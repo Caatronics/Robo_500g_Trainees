@@ -9,69 +9,68 @@
 #include "driver/ledc.h"
 #include <math.h>
 
-// Definição da GPIO utilizada no controle das placas
-/* ─── Pinos de direção ─────────────────────────────────────────── */
-#define IN1_PIN  GPIO_NUM_32    // Motor A pra frente
-#define IN2_PIN  GPIO_NUM_33    // Motor A pra tras
-#define IN3_PIN  GPIO_NUM_25    // Motor B pra frente
-#define IN4_PIN  GPIO_NUM_26    // Motor B pra tras
+/* ─── Pinos de direção (L298N) ─────────────────────────────────── */
+#define IN1_PIN  GPIO_NUM_32    // Motor Esquerdo (A) - Frente
+#define IN2_PIN  GPIO_NUM_33    // Motor Esquerdo (A) - Trás
+#define IN3_PIN  GPIO_NUM_25    // Motor Direito (B)  - Frente
+#define IN4_PIN  GPIO_NUM_26    // Motor Direito (B)  - Trás
 
-/* ─── Pinos de velocidade (PWM) ────────────────────────────────────── */
-#define ENA_PIN  GPIO_NUM_19   // Motor A
-#define ENB_PIN  GPIO_NUM_18   // Motor B
+/* ─── Pinos de velocidade (PWM) ────────────────────────────────── */
+#define ENA_PIN  GPIO_NUM_19    // Enable Motor Esquerdo (A)
+#define ENB_PIN  GPIO_NUM_18    // Enable Motor Direito (B)
 
-// Definição dos parâmetros do PWM
-/* ─── Configuração LEDC ────────────────────────────────────────── */
-#define PWM_FREQ_HZ     10000                   // 10 kHz
+/* ─── Configuração LEDC PWM ────────────────────────────────────── */
+#define PWM_FREQ_HZ     4000                    // 4 kHz (ideal para L298N, evita perda de torque em alta freq)
 #define PWM_RESOLUTION  LEDC_TIMER_10_BIT       // 1024 níveis (0–1023)
+#define MAX_PWM         1023                    // (2^10 - 1)
 
 #define LEDC_TIMER      LEDC_TIMER_0
-#define LEDC_MODE       LEDC_LOW_SPEED_MODE     // Fast PWM = Low Speed no ESP32
+#define LEDC_MODE       LEDC_LOW_SPEED_MODE
 
-#define CHANNEL_A       LEDC_CHANNEL_0          // EN para motor A
-#define CHANNEL_B       LEDC_CHANNEL_1          // EN para motor B
+#define CHANNEL_A       LEDC_CHANNEL_0          // Canal PWM para Motor A
+#define CHANNEL_B       LEDC_CHANNEL_1          // Canal PWM para Motor B
 
-#define DEADZONE 20
-#define DEGRAU_ACELERAR 150                     //Limite máximo de aumento da força lógica por ciclo para as bordas
-#define DEGRAU_FREAR 35                         //Limite máximo de aumento da força lógica por ciclo para o centro
+/* ─── Parâmetros de Controle e Dirigibilidade ──────────────────── */
+#define DEADZONE        40      // Zona morta do analógico (mesmo padrão do BTS7960)
+#define MAX_JOYSTICK    512.0f  // Valor máximo do eixo no Bluepad32
+#define FATOR_CURVA     2.0f    // Atenuação da curva (1.0 = giro agressivo no próprio eixo, 2.0 a 5.0 = curva mais suave)
 
-#define MAX_JOYSTICK 512
-#define MAX_PWM 1023
-#define TEMPO_DELAY 20 
+// Rampa de aceleração/frenagem (executada a cada 20ms na Task)
+#define DEGRAU_ACELERAR 150     // Passo máximo por ciclo (20ms) ao acelerar
+#define DEGRAU_FREAR    80      // Passo máximo por ciclo (20ms) ao desacelerar/retornar ao centro
+#define TEMPO_DELAY_REV 15      // Delay (ms) de proteção ao inverter sentido de rotação
 
-// Variáveis globais
-int left_x, left_y, right_x, right_y;
-// Isso aqui só mantive do exemplo
+// Variáveis globais (volatile pois são escritas no callback BT e lidas na Task)
+volatile int left_x = 0, left_y = 0, right_x = 0, right_y = 0;
+
 // Custom "instance"
 typedef struct my_platform_instance_s {
-    uni_gamepad_seat_t gamepad_seat;  // which "seat" is being used
+    uni_gamepad_seat_t gamepad_seat;
 } my_platform_instance_t;
 
-// Declarations (Só mantive do exemplo)
+// Declarations
 static void trigger_event_on_gamepad(uni_hid_device_t* d);
 static my_platform_instance_t* get_my_platform_instance(uni_hid_device_t* d);
 
-// Variáveis globais
-
-
-// iniciar motores "desligados" 
-void InitGpioMotores(){
+// Inicializa os pinos digitais da Ponte H L298N
+void InitGpioMotores(void) {
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << IN1_PIN) | (1ULL << IN2_PIN) | (1ULL << IN3_PIN) | (1ULL << IN4_PIN),// avisa pra esp32 que aquele pino ta ligado colocando o bit 1 na posição especifica
-        .mode = GPIO_MODE_OUTPUT,  // define pino como saida
-        .pull_up_en = GPIO_PULLUP_DISABLE, // nao precisa de pull up, pois o ledc ja vai cuidar disso
-        .pull_down_en = GPIO_PULLDOWN_DISABLE, // nao precisa de pull down, pois o ledc ja vai cuidar disso
-        .intr_type = GPIO_INTR_DISABLE //nao precisa pq o motor nao vai precisar interromper o codigo
+        .pin_bit_mask = (1ULL << IN1_PIN) | (1ULL << IN2_PIN) | (1ULL << IN3_PIN) | (1ULL << IN4_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
     };
     ESP_ERROR_CHECK(gpio_config(&io_conf));
 
-    gpio_set_level(IN1_PIN,0);
-    gpio_set_level(IN2_PIN,0);
-    gpio_set_level(IN3_PIN,0);  
-    gpio_set_level(IN4_PIN,0);
+    gpio_set_level(IN1_PIN, 0);
+    gpio_set_level(IN2_PIN, 0);
+    gpio_set_level(IN3_PIN, 0);
+    gpio_set_level(IN4_PIN, 0);
 }
 
-void InitPwmMotores() {
+// Inicializa os canais de PWM no periférico LEDC
+void InitPwmMotores(void) {
     ledc_timer_config_t ledc_timer = {
         .speed_mode       = LEDC_MODE,
         .timer_num        = LEDC_TIMER,
@@ -104,169 +103,157 @@ void InitPwmMotores() {
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel_b));
 }
 
-int Deadzone(int valor_analogico) {
-     // Valores entre -DEADZONE e DEADZONE serão considerados zero
-    if(abs(valor_analogico) < DEADZONE) {
+// Função de Deadzone para limpar ruído do analógico
+int apply_deadzone(int value, int deadzone) {
+    if (abs(value) < deadzone) {
         return 0;
     }
-    return valor_analogico;
+    return value;
 }
 
-void ProcessarMovimento(int x, int y) {
-
-    // Variáveis estáticas para lembrar posição do analogico no ciclo anterior
-    static int atualEsq = 0;
-    static int atualDir = 0;
-    // Variáveis estáticas para lembrar a direção no ciclo anterior (considerando 1 = Frente, 0 = Trás)
-    static int direcaoAntigaEsq = 1; 
-    static int direcaoAntigaDir = 1;
-
-
-    int alvoEsq = y + x;
-    int alvoDir = y - x;
-
-    // Limita o alvo entre -512 e +512 (trava de segurança)
-    if(alvoEsq > MAX_JOYSTICK){
-        alvoEsq = MAX_JOYSTICK;
-    }
-    if(alvoEsq < -MAX_JOYSTICK){  
-        alvoEsq = -MAX_JOYSTICK;
-    }
-    if(alvoDir > MAX_JOYSTICK){
-        alvoDir = MAX_JOYSTICK;
-    }
-    if(alvoDir < -MAX_JOYSTICK){
-        alvoDir = -MAX_JOYSTICK;
-    } 
-
-    // se o analogico estiver indo em direção ao centro o passo maximo é 35
-    // mas se o analogico estiver indo para fora o passo maximo é 150
-    int passoEsq;
-    if(abs(alvoEsq) > abs(atualEsq) && (alvoEsq * atualEsq >= 0)) {
-        passoEsq = DEGRAU_ACELERAR;
-    }else{
-        passoEsq = DEGRAU_FREAR; 
-    }
-
-    // Aplica o passo para chegar no alvo
-    if(alvoEsq > atualEsq + passoEsq){
-        atualEsq += passoEsq;
-    }else if (alvoEsq < atualEsq - passoEsq){
-        atualEsq -= passoEsq;
-    }else{
-        atualEsq = alvoEsq;
-    }
-
-    int passoDir;
-    if(abs(alvoDir) > abs(atualDir) && (alvoDir * atualDir >= 0)) {
-        passoDir = DEGRAU_ACELERAR;
-    }else{
-        passoDir = DEGRAU_FREAR;
-    }
-
-    if(alvoDir > atualDir + passoDir){
-        atualDir += passoDir;
-    }else if (alvoDir < atualDir - passoDir){
-        atualDir -= passoDir;
-    }else{   
-        atualDir = alvoDir;
-    }
-    
-    // tranformar o valor para PWM 
-    uint32_t dutyEsq = abs(atualEsq) * 2;
-    if (dutyEsq > MAX_PWM){
-        dutyEsq = MAX_PWM;
-    }
-    
-    uint32_t dutyDir = abs(atualDir) * 2;
-    if (dutyDir > MAX_PWM){
-        dutyDir = MAX_PWM;
-    }
-
-    // Descobre qual é a direção atual baseada no sinal da força 
-    int direcaoNovaEsq;
-    if (atualEsq >= 0) {
-        direcaoNovaEsq = 1;
+// Função auxiliar para aplicar a rampa de aceleração/frenagem por motor
+int aplicar_rampa(int alvo, int atual) {
+    int passo;
+    // Se estiver acelerando na mesma direção, usa DEGRAU_ACELERAR; caso contrário, usa DEGRAU_FREAR
+    if (abs(alvo) > abs(atual) && (alvo * atual >= 0)) {
+        passo = DEGRAU_ACELERAR;
     } else {
-        direcaoNovaEsq = 0;
+        passo = DEGRAU_FREAR;
     }
 
-    int direcaoNovaDir;
-    if (atualDir >= 0) {
-        direcaoNovaDir = 1;
+    if (alvo > atual + passo) {
+        return atual + passo;
+    } else if (alvo < atual - passo) {
+        return atual - passo;
     } else {
-        direcaoNovaDir = 0;
+        return alvo;
     }
-
-    // Se a direção de algum dos motores mudar de um delay de 20ms e zere o PWM
-    if (direcaoNovaEsq != direcaoAntigaEsq || direcaoNovaDir != direcaoAntigaDir) {
-        
-        // zera o pwm
-        ledc_set_duty(LEDC_MODE, CHANNEL_A, 0);
-        ledc_update_duty(LEDC_MODE, CHANNEL_A);
-        ledc_set_duty(LEDC_MODE, CHANNEL_B, 0);
-        ledc_update_duty(LEDC_MODE, CHANNEL_B);
-        
-        // aplica 20ms de delay
-        vTaskDelay(pdMS_TO_TICKS(TEMPO_DELAY));
-        
-        //atualiza pro proximo ciclo
-        direcaoAntigaEsq = direcaoNovaEsq;
-        direcaoAntigaDir = direcaoNovaDir;
-    }
-    
-    // Configura o Motor Esquerdo
-    
-    if (atualEsq >= 0) { 
-        // Indo para Frente ou Parado
-        gpio_set_level(IN1_PIN, 1); 
-        gpio_set_level(IN2_PIN, 0);
-    } else { 
-        // Indo para Trás
-        gpio_set_level(IN1_PIN, 0); 
-        gpio_set_level(IN2_PIN, 1);
-    }
-    ledc_set_duty(LEDC_MODE, CHANNEL_A,dutyEsq);
-    ledc_update_duty(LEDC_MODE, CHANNEL_A);
-
-    // Configura o Motor Direito
-    if (atualDir >= 0) {
-        // Indo para Frente ou Parado
-        gpio_set_level(IN3_PIN, 1);
-        gpio_set_level(IN4_PIN, 0);
-    } else {
-        // Indo para Trás
-        gpio_set_level(IN3_PIN, 0); 
-        gpio_set_level(IN4_PIN, 1);
-    }
-    ledc_set_duty(LEDC_MODE, CHANNEL_B, dutyDir);
-    ledc_update_duty(LEDC_MODE, CHANNEL_B);
 }
 
+// Task dedicada para leitura contínua dos eixos e atualização da Ponte H L298N
+void TaskControleMotoresL298N(void *pvParameter) {
+    InitGpioMotores();
+    InitPwmMotores();
 
+    int atualEsq = 0;
+    int atualDir = 0;
 
-// É nessa função que vão as configurações, FreeRTOS e afins
+    // 1 = Frente, -1 = Ré, 0 = Parado
+    int dirAntigaEsq = 0;
+    int dirAntigaDir = 0;
+
+    logi("Task L298N inicializada com sucesso!\n");
+
+    while (1) {
+        // 1. Leitura com Deadzone
+        // OBS: No Bluepad32 (PS4), empurrar o analógico para FRENTE gera left_y NEGATIVO (-512).
+        // Por isso invertemos o sinal de left_y (-left_y) para que FRENTE seja POSITIVO (+512)
+        // e TRÁS seja NEGATIVO (-512), facilitando toda a matemática de mistura.
+        float x_axis = (float)apply_deadzone(left_x, DEADZONE);
+        float y_axis = (float)apply_deadzone(-left_y, DEADZONE);
+
+        // 2. Cálculo da curva (seguindo a lógica do BTS7960)
+        float curva = x_axis / FATOR_CURVA;
+
+        // Se o robô estiver parado no eixo Y e você mexer só o X, permite girar no próprio eixo
+        // Se quiser igualzinho ao BTS7960 (mesmo fator sempre), basta manter a soma direta:
+        int alvoEsq = (int)(y_axis + curva);
+        int alvoDir = (int)(y_axis - curva);
+
+        // 3. Limita os valores máximos e mínimos (-512 a +512)
+        if (alvoEsq > (int)MAX_JOYSTICK)  alvoEsq = (int)MAX_JOYSTICK;
+        if (alvoEsq < -(int)MAX_JOYSTICK) alvoEsq = -(int)MAX_JOYSTICK;
+        if (alvoDir > (int)MAX_JOYSTICK)  alvoDir = (int)MAX_JOYSTICK;
+        if (alvoDir < -(int)MAX_JOYSTICK) alvoDir = -(int)MAX_JOYSTICK;
+
+        // 4. Aplica a rampa de aceleração/frenagem a cada 20ms
+        atualEsq = aplicar_rampa(alvoEsq, atualEsq);
+        atualDir = aplicar_rampa(alvoDir, atualDir);
+
+        // 5. Determina a direção atual de cada motor (1 = Frente, -1 = Ré, 0 = Parado)
+        int dirNovaEsq = (atualEsq > 0) ? 1 : ((atualEsq < 0) ? -1 : 0);
+        int dirNovaDir = (atualDir > 0) ? 1 : ((atualDir < 0) ? -1 : 0);
+
+        // 6. Proteção contra curto/pico de corrente na reversão brusca de sentido
+        bool inverteuEsq = (dirNovaEsq != 0 && dirAntigaEsq != 0 && dirNovaEsq != dirAntigaEsq);
+        bool inverteuDir = (dirNovaDir != 0 && dirAntigaDir != 0 && dirNovaDir != dirAntigaDir);
+
+        if (inverteuEsq || inverteuDir) {
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, CHANNEL_A, 0));
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, CHANNEL_A));
+            ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, CHANNEL_B, 0));
+            ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, CHANNEL_B));
+
+            gpio_set_level(IN1_PIN, 0);
+            gpio_set_level(IN2_PIN, 0);
+            gpio_set_level(IN3_PIN, 0);
+            gpio_set_level(IN4_PIN, 0);
+
+            vTaskDelay(pdMS_TO_TICKS(TEMPO_DELAY_REV));
+        }
+
+        if (dirNovaEsq != 0) dirAntigaEsq = dirNovaEsq;
+        if (dirNovaDir != 0) dirAntigaDir = dirNovaDir;
+
+        // 7. Cálculo do Duty Cycle do PWM (0 a 1023)
+        uint32_t dutyEsq = (uint32_t)((fabsf((float)atualEsq) / MAX_JOYSTICK) * MAX_PWM);
+        uint32_t dutyDir = (uint32_t)((fabsf((float)atualDir) / MAX_JOYSTICK) * MAX_PWM);
+
+        if (dutyEsq > MAX_PWM) dutyEsq = MAX_PWM;
+        if (dutyDir > MAX_PWM) dutyDir = MAX_PWM;
+
+        // 8. Acionamento dos pinos de direção e PWM - MOTOR ESQUERDO (A)
+        if (atualEsq > 0) {
+            gpio_set_level(IN1_PIN, 1);
+            gpio_set_level(IN2_PIN, 0);
+        } else if (atualEsq < 0) {
+            gpio_set_level(IN1_PIN, 0);
+            gpio_set_level(IN2_PIN, 1);
+        } else {
+            // Ponto morto (Coast) quando o controle está solto
+            gpio_set_level(IN1_PIN, 0);
+            gpio_set_level(IN2_PIN, 0);
+        }
+        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, CHANNEL_A, dutyEsq));
+        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, CHANNEL_A));
+
+        // 9. Acionamento dos pinos de direção e PWM - MOTOR DIREITO (B)
+        if (atualDir > 0) {
+            gpio_set_level(IN3_PIN, 1);
+            gpio_set_level(IN4_PIN, 0);
+        } else if (atualDir < 0) {
+            gpio_set_level(IN3_PIN, 0);
+            gpio_set_level(IN4_PIN, 1);
+        } else {
+            // Ponto morto (Coast) quando o controle está solto
+            gpio_set_level(IN3_PIN, 0);
+            gpio_set_level(IN4_PIN, 0);
+        }
+        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, CHANNEL_B, dutyDir));
+        ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, CHANNEL_B));
+
+        // Ciclo fixo de 20ms (50Hz) igual ao código do BTS7960
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// Inicialização da plataforma e criação da Task do FreeRTOS
 static void my_platform_init(int argc, const char** argv) {
     ARG_UNUSED(argc);
     ARG_UNUSED(argv);
 
-    logi("Bluepad32: Inicializando configuração\n");
+    logi("Bluepad32: Inicializando configuração para L298N\n");
 
-    InitGpioMotores(); // Liga e configura as GPIOs de direção
-    InitPwmMotores();  // Liga e configura os canais de velocidade (PWM)
-    
-    logi("Motores e PWM configurados com sucesso!\n");
-    
+    // Cria a Task que gerencia o PWM e os pinos do L298N continuamente
+    xTaskCreate(&TaskControleMotoresL298N, "Controle L298N", 4096, NULL, 1, NULL);
 }
 
 static void my_platform_on_init_complete(void) {
     logi("Bluepad32: Configuração concluída\n");
 
-    // Inicia a busca por dispositivos
     uni_bt_start_scanning_and_autoconnect_unsafe();
     uni_bt_allow_incoming_connections(true);
 
-    // Baseada no tempo de execução, isso deleta ou lista as    chaves Bluetooth armazenadas
     if (1)
         uni_bt_del_keys_unsafe();
     else
@@ -274,19 +261,10 @@ static void my_platform_on_init_complete(void) {
 }
 
 static uni_error_t my_platform_on_device_discovered(bd_addr_t addr, const char* name, uint16_t cod, uint8_t rssi) {
-    // You can filter discovered devices here.
-    // Just return any value different from UNI_ERROR_SUCCESS;
-    // @param addr: the Bluetooth address
-    // @param name: could be NULL, could be zero-length, or might contain the name.
-    // @param cod: Class of Device. See "uni_bt_defines.h" for possible values.
-    // @param rssi: Received Signal Strength Indicator (RSSI) measured in dBms. The higher (255) the better.
-
-    // As an example, if you want to filter out keyboards, do:
     if (((cod & UNI_BT_COD_MINOR_MASK) & UNI_BT_COD_MINOR_KEYBOARD) == UNI_BT_COD_MINOR_KEYBOARD) {
         logi("Ignoring keyboard\n");
         return UNI_ERROR_IGNORE_DEVICE;
     }
-
     return UNI_ERROR_SUCCESS;
 }
 
@@ -296,6 +274,11 @@ static void my_platform_on_device_connected(uni_hid_device_t* d) {
 
 static void my_platform_on_device_disconnected(uni_hid_device_t* d) {
     logi("Bluepad32: Dispositivo desconectado: %p\n", d);
+    // Segurança: para o robô imediatamente se o controle de PS4 desconectar
+    left_x = 0;
+    left_y = 0;
+    right_x = 0;
+    right_y = 0;
 }
 
 static uni_error_t my_platform_on_device_ready(uni_hid_device_t* d) {
@@ -309,46 +292,29 @@ static uni_error_t my_platform_on_device_ready(uni_hid_device_t* d) {
 
 static void my_platform_on_controller_data(uni_hid_device_t* d, uni_controller_t* ctl) {
     static uni_controller_t prev = {0};
-    
-    // Variável para armazenar as informações recebidas do controle
-    // Basicamente vai em:
-    // componentes/bluepad32/include/controller/uni_gamepad.h
-    // Lá tem todas as structs de valores que você pode receber
     uni_gamepad_t* gp;
-    uni_gamepad_mappings_t* tg;
 
-    // Comenta isso aqui no projeto final, no exemplo diz que é para não ter
-    // spam desnecessário de logs
     if (memcmp(&prev, ctl, sizeof(*ctl)) == 0) {
         return;
     }
     prev = *ctl;
 
-    // Essa função é para garantir que só vai executar ações caso
-    // o que tenha se conectado seja um controle do tipo GAMEPAD
-    // no caso o controle de PS4, se for testar algo diferente, coemnta o if
-    if(ctl->klass != UNI_CONTROLLER_CLASS_GAMEPAD) {
+    if (ctl->klass != UNI_CONTROLLER_CLASS_GAMEPAD) {
         return;
     }
 
-    // Mudando a cor do led do controle para verde (8 bits)
-    //                                     r,  g,  0
-    d->report_parser.set_lightbar_color(d, 0, 255, 0);
-    
-    // Extrai os dados do controle
+    // Muda a cor do LED do controle para verde
+    if (d->report_parser.set_lightbar_color != NULL) {
+        d->report_parser.set_lightbar_color(d, 0, 255, 0);
+    }
+
     gp = &ctl->gamepad;
 
-    // Valores dos analógicos
+    // Apenas atualiza as variáveis globais (sem bloquear o callback Bluetooth)
     left_x = gp->axis_x;
     left_y = gp->axis_y;
     right_x = gp->axis_rx;
     right_y = gp->axis_ry;
-
-    //aplicando Deadzone
-    left_x = Deadzone(left_x);
-    left_y = Deadzone(left_y);
-
-    ProcessarMovimento(left_x, left_y);
 }
 
 static const uni_property_t* my_platform_get_property(uni_property_idx_t idx) {
@@ -395,8 +361,7 @@ static void trigger_event_on_gamepad(uni_hid_device_t* d) {
     my_platform_instance_t* ins = get_my_platform_instance(d);
 
     if (d->report_parser.play_dual_rumble != NULL) {
-        d->report_parser.play_dual_rumble(d, 0 /* delayed start ms */, 150 /* duration ms */, 128 /* weak magnitude */,
-                                          40 /* strong magnitude */);
+        d->report_parser.play_dual_rumble(d, 0, 150, 128, 40);
     }
 
     if (d->report_parser.set_player_leds != NULL) {
